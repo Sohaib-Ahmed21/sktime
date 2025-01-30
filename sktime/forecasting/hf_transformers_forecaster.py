@@ -179,9 +179,9 @@ class HFTransformersForecaster(BaseForecaster):
         config = AutoConfig.from_pretrained(
             self.model_path, trust_remote_code=self.trust_remote_code
         )
-        config = self.update_config(config, X, y, fh)
+        config = self.update_config(config, X, fh)
 
-        self.model, info = self.load_model(config, self.model_path)
+        self.model, info = self.load_model(config)
         self.context_length, self.prediction_length = self.get_seq_args(config)
         print(self.prediction_length)
 
@@ -330,7 +330,7 @@ class HFTransformersForecaster(BaseForecaster):
         )
         return pred.loc[fh.to_absolute(self.cutoff)._values]
 
-    def update_config(self, config, X, y, fh):
+    def update_config(self, config, X, fh):
         """Update config with user provided config."""
         _config = config.to_dict()
         _config.update(self._config)
@@ -352,7 +352,7 @@ class HFTransformersForecaster(BaseForecaster):
         config = config.from_dict(_config)
         return config
 
-    def load_model(self, config, model_path, **kwargs):
+    def load_model(self, config, **kwargs):
         """Load model from config."""
         import transformers
 
@@ -394,6 +394,8 @@ class HFTransformersForecaster(BaseForecaster):
         fh,
     ):
         """Predict output based on unique method of each model."""
+        # fh for interface consistency as we're supplying
+        # superset of possible args for each function
         pred = self.model.generate(
             past_values=past_values,
             past_time_features=past_time_features,

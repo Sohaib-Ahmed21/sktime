@@ -61,8 +61,10 @@ class TimerForecaster(HFTransformersForecaster):
             trust_remote_code=trust_remote_code,
         )
 
-    def update_config(self, config, X, y, fh):
+    def update_config(self, config, X, fh):
         """Update config with user provided config."""
+        # X for interface consistency as we're supplying
+        # superset of possible args for each function
         _config = config.to_dict()
         _config.update(self._config)
 
@@ -75,7 +77,7 @@ class TimerForecaster(HFTransformersForecaster):
         config = config.from_dict(_config)
         return config
 
-    def load_model(self, config, model_path, **kwargs):
+    def load_model(self, config, **kwargs):
         """Load model from config."""
         from transformers import (
             AutoModelForCausalLM,
@@ -105,6 +107,8 @@ class TimerForecaster(HFTransformersForecaster):
         fh,
     ):
         """Predict output based on unique method of each model."""
+        # unused args are for interface consistency as we're supplying
+        # superset of possible args for each function
         pred = self.model.generate(
             inputs=past_values,
             max_new_tokens=max(fh._values),
