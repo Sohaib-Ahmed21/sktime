@@ -153,6 +153,7 @@ class HFTransformersForecaster(BaseForecaster):
         deterministic=False,
         callbacks=None,
         peft_config=None,
+        trust_remote_code=False,
     ):
         super().__init__()
         self.model_path = model_path
@@ -169,56 +170,20 @@ class HFTransformersForecaster(BaseForecaster):
         self.callbacks = callbacks
         self._callbacks = callbacks
         self.peft_config = peft_config
+        self.trust_remote_code = trust_remote_code
 
     def _fit(self, y, X, fh):
         from transformers import AutoConfig, Trainer, TrainingArguments
 
         # Load model and extract config
-        config = AutoConfig.from_pretrained(self.model_path)
-
-        # Update config with user provided config
-        _config = config.to_dict()
-        _config.update(self._config)
-        _config["num_dynamic_real_features"] = X.shape[-1] if X is not None else 0
-        _config["num_static_real_features"] = 0
-        _config["num_dynamic_real_features"] = 0
-        _config["num_static_categorical_features"] = 0
-        _config["num_time_features"] = 0 if X is None else X.shape[-1]
-
-        if hasattr(config, "feature_size"):
-            del _config["feature_size"]
-
-        if fh is not None:
-            _config["prediction_length"] = max(
-                *(fh.to_relative(self._cutoff)._values + 1),
-                _config["prediction_length"],
-            )
-
-        config = config.from_dict(_config)
-        import transformers
-
-        prediction_model_class = None
-        if hasattr(config, "architectures") and config.architectures is not None:
-            prediction_model_class = config.architectures[0]
-        elif hasattr(config, "model_type"):
-            prediction_model_class = (
-                "".join(x.capitalize() for x in config.model_type.lower().split("_"))
-                + "ForPrediction"
-            )
-        else:
-            raise ValueError(
-                "The model type is not inferable from the config."
-                "Thus, the model cannot be loaded."
-            )
-        # Load model with the updated config
-        self.model, info = getattr(
-            transformers, prediction_model_class
-        ).from_pretrained(
-            self.model_path,
-            config=config,
-            output_loading_info=True,
-            ignore_mismatched_sizes=True,
+        config = AutoConfig.from_pretrained(
+            self.model_path, trust_remote_code=self.trust_remote_code
         )
+        config = self.update_config(config, X, y, fh)
+
+        self.model, info = self.load_model(config, self.model_path)
+        self.context_length, self.prediction_length = self.get_seq_args(config)
+        print(self.prediction_length)
 
         # Freeze all loaded parameters
         for param in self.model.parameters():
@@ -243,23 +208,23 @@ class HFTransformersForecaster(BaseForecaster):
 
             train_dataset = PyTorchDataset(
                 y[:split],
-                config.context_length + max(config.lags_sequence),
+                self.context_length,
                 X=X[:split] if X is not None else None,
-                fh=config.prediction_length,
+                fh=self.prediction_length,
             )
 
             eval_dataset = PyTorchDataset(
                 y[split:],
-                config.context_length + max(config.lags_sequence),
+                self.context_length,
                 X=X[split:] if X is not None else None,
-                fh=config.prediction_length,
+                fh=self.prediction_length,
             )
         else:
             train_dataset = PyTorchDataset(
                 y,
-                config.context_length + max(config.lags_sequence),
+                self.context_length,
                 X=X if X is not None else None,
-                fh=config.prediction_length,
+                fh=self.prediction_length,
             )
 
             eval_dataset = None
@@ -321,53 +286,124 @@ class HFTransformersForecaster(BaseForecaster):
         if X is not None:
             hist_x = self._X.values.reshape((1, -1, self._X.shape[-1]))
             x_ = X.values.reshape((1, -1, self._X.shape[-1]))
-            if x_.shape[1] < self.model.config.prediction_length:
+            if x_.shape[1] < self.prediction_length:
                 # TODO raise exception here?
-                x_ = np.resize(
-                    x_, (1, self.model.config.prediction_length, x_.shape[-1])
-                )
+                x_ = np.resize(x_, (1, self.prediction_length, x_.shape[-1]))
         else:
-            hist_x = np.array(
-                [
-                    [[]]
-                    * (
-                        self.model.config.context_length
-                        + max(self.model.config.lags_sequence)
-                    )
-                ]
-            )
-            x_ = np.array([[[]] * self.model.config.prediction_length])
+            hist_x = np.array([[[]] * (self.context_length)])
+            x_ = np.array([[[]] * self.prediction_length])
 
-        pred = self.model.generate(
-            past_values=from_numpy(hist).to(self.model.dtype).to(self.model.device),
-            past_time_features=from_numpy(
+        past_values = from_numpy(hist).to(self.model.dtype).to(self.model.device)
+
+        past_time_features = (
+            from_numpy(
                 hist_x[
                     :,
-                    -self.model.config.context_length
-                    - max(self.model.config.lags_sequence) :,
+                    -self.context_length :,
                 ]
             )
             .to(self.model.dtype)
-            .to(self.model.device),
-            future_time_features=from_numpy(x_)
-            .to(self.model.dtype)
-            .to(self.model.device),
-            past_observed_mask=from_numpy((~np.isnan(hist)).astype(int)).to(
-                self.model.device
-            ),
+            .to(self.model.device)
         )
 
-        pred = pred.sequences.mean(dim=1).detach().cpu().numpy().T
+        future_time_features = from_numpy(x_).to(self.model.dtype).to(self.model.device)
+
+        past_observed_mask = from_numpy((~np.isnan(hist)).astype(int)).to(
+            self.model.device
+        )
+
+        pred = self.pred_output(
+            past_values,
+            past_time_features,
+            future_time_features,
+            past_observed_mask,
+            fh,
+        )
 
         pred = pd.Series(
-            pred.reshape((-1,)),
-            index=ForecastingHorizon(range(len(pred)))
+            pred,
+            index=ForecastingHorizon(range(1, len(pred) + 1))
             .to_absolute(self._cutoff)
             ._values,
             # columns=self._y.columns
             name=self._y.name,
         )
         return pred.loc[fh.to_absolute(self.cutoff)._values]
+
+    def update_config(self, config, X, y, fh):
+        """Update config with user provided config."""
+        _config = config.to_dict()
+        _config.update(self._config)
+        _config["num_dynamic_real_features"] = X.shape[-1] if X is not None else 0
+        _config["num_static_real_features"] = 0
+        _config["num_dynamic_real_features"] = 0
+        _config["num_static_categorical_features"] = 0
+        _config["num_time_features"] = 0 if X is None else X.shape[-1]
+
+        if hasattr(config, "feature_size"):
+            del _config["feature_size"]
+
+        if fh is not None:
+            _config["prediction_length"] = max(
+                *(fh.to_relative(self._cutoff)._values + 1),
+                _config["prediction_length"],
+            )
+
+        config = config.from_dict(_config)
+        return config
+
+    def load_model(self, config, model_path, **kwargs):
+        """Load model from config."""
+        import transformers
+
+        prediction_model_class = None
+        if hasattr(config, "architectures") and config.architectures is not None:
+            prediction_model_class = config.architectures[0]
+        elif hasattr(config, "model_type"):
+            prediction_model_class = (
+                "".join(x.capitalize() for x in config.model_type.lower().split("_"))
+                + "ForPrediction"
+            )
+        else:
+            raise ValueError(
+                "The model type is not inferable from the config."
+                "Thus, the model cannot be loaded."
+            )
+        # Load model with the updated config
+        model, info = getattr(transformers, prediction_model_class).from_pretrained(
+            self.model_path,
+            config=config,
+            output_loading_info=True,
+            ignore_mismatched_sizes=True,
+        )
+        print(config.prediction_length)
+        return model, info
+
+    def get_seq_args(self, config):
+        """Get context and pred length."""
+        context_len = config.context_length + max(config.lags_sequence)
+        pred_len = config.prediction_length
+        return context_len, pred_len
+
+    def pred_output(
+        self,
+        past_values,
+        past_time_features,
+        future_time_features,
+        past_observed_mask,
+        fh,
+    ):
+        """Predict output based on unique method of each model."""
+        pred = self.model.generate(
+            past_values=past_values,
+            past_time_features=past_time_features,
+            future_time_features=future_time_features,
+            past_observed_mask=past_observed_mask,
+        )
+        pred = pred.sequences.mean(dim=1).detach().cpu().numpy().T
+
+        pred = pred.reshape((-1,))
+        return pred
 
     @classmethod
     def get_test_params(cls, parameter_set="default"):
@@ -484,6 +520,10 @@ class PyTorchDataset(Dataset):
             "future_time_features": exog_data,
             "past_observed_mask": (~hist_y.isnan()).to(int),
             "future_values": from_numpy(
+                self.y[i + self.seq_len : i + self.seq_len + self.fh]
+            ).float(),
+            "input_ids": hist_y,
+            "labels": from_numpy(
                 self.y[i + self.seq_len : i + self.seq_len + self.fh]
             ).float(),
         }
